@@ -19,19 +19,33 @@ def handle_upload(files: List) -> str:
         Status message
     """
     if not files:
-        return "Please upload at least one file."
+        return "请至少上传一个文件。"
 
     try:
         # Get file paths from uploaded files
         file_paths = [f.name for f in files]
-        file_names = [f.name.split("/")[-1].split("\\")[-1] for f in files]
 
-        # Index documents
-        index_documents(file_paths)
+        # Index documents with chunk-level deduplication
+        result = index_documents(file_paths)
 
-        return f"Successfully indexed {len(files)} file(s): {', '.join(file_names)}"
+        # Build status message
+        messages = [
+            f"📄 处理文件: {', '.join(result.files_processed)}",
+            f"📊 总 chunks: {result.total_chunks}",
+        ]
+
+        if result.indexed_chunks > 0:
+            messages.append(f"✅ 新索引: {result.indexed_chunks} 个 chunks")
+
+        if result.skipped_chunks > 0:
+            messages.append(f"⏭️ 跳过重复: {result.skipped_chunks} 个 chunks")
+
+        if result.indexed_chunks == 0 and result.skipped_chunks > 0:
+            messages.append("ℹ️ 所有内容已存在，无需重复索引")
+
+        return "\n".join(messages)
     except Exception as e:
-        return f"Error indexing files: {str(e)}"
+        return f"索引文件时出错: {str(e)}"
 
 
 def handle_query(question: str) -> Tuple[str, str]:
@@ -85,7 +99,7 @@ def create_app() -> gr.Blocks:
                 file_types=[".md", ".txt"],
             )
             upload_btn = gr.Button("Index Documents", variant="primary")
-            upload_status = gr.Textbox(label="Status", interactive=False)
+            upload_status = gr.Textbox(label="Status", interactive=False, lines=6)
 
             upload_btn.click(
                 fn=handle_upload,

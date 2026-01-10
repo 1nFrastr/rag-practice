@@ -1,4 +1,4 @@
-# RAG Notes - Local Q&A Assistant
+# RAG Notes - Local Q&A Assistant Edited
 
 A local RAG (Retrieval-Augmented Generation) note Q&A assistant that allows you to upload Markdown/TXT files and ask questions about their content.
 
