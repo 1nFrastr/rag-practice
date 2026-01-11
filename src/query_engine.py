@@ -1,7 +1,7 @@
 """Query engine module for RAG-based question answering."""
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Generator, Tuple
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.response_synthesizers import ResponseMode
@@ -313,3 +313,190 @@ def query(
                 scores=scores,
                 debug_info=debug_info,
             )
+
+
+def query_stream(
+    question: str,
+    use_hybrid: bool = False,
+    use_rerank: bool = False
+) -> Generator[Tuple[str, QueryResult | None], None, None]:
+    """
+    Query the indexed documents with streaming response.
+
+    Args:
+        question: User's question
+        use_hybrid: If True, use hybrid search (BM25 + Vector)
+        use_rerank: If True, use Cohere reranking
+
+    Yields:
+        Tuple of (partial_answer, final_result)
+        - During streaming: (partial_text, None)
+        - At the end: (full_text, QueryResult)
+    """
+    with traced_operation(
+        "rag_query_stream",
+        span_kind=SpanKind.CHAIN,
+        input_value=question,
+        attributes={
+            "use_hybrid": use_hybrid,
+            "use_rerank": use_rerank,
+            "search_mode": "hybrid" if use_hybrid else "vector",
+            "streaming": True
+        }
+    ) as parent_span:
+        config.validate()
+
+        # Get existing index
+        index = get_existing_index()
+
+        # Helper function to extract node info for debug
+        def _node_to_debug_dict(node_with_score, max_preview_len=100):
+            node = node_with_score.node
+            text = node.text
+            preview = text[:max_preview_len] + "..." if len(text) > max_preview_len else text
+            filename = node.metadata.get("filename", "Unknown")
+            chunk_hash = node.metadata.get("chunk_hash", "")
+            chunk_id = chunk_hash[:8] if chunk_hash else node.node_id[:8]
+            score = node_with_score.score if node_with_score.score is not None else 0.0
+            return {"filename": filename, "score": score, "text_preview": preview, "chunk_id": chunk_id}
+
+        # Initialize debug info
+        debug_hybrid_results = []
+        debug_vector_results = []
+        debug_reranked_results = []
+        debug_final_results = []
+        debug_llm_input = ""
+
+        # Retrieve nodes based on strategy
+        if use_hybrid:
+            from .hybrid_search import hybrid_search
+            from .reranker import rerank_results
+
+            retrieved_nodes = hybrid_search(
+                index=index,
+                query=question,
+                top_k=20,
+                use_hybrid=True
+            )
+            debug_hybrid_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+
+            if use_rerank:
+                retrieved_nodes = rerank_results(
+                    query=question,
+                    nodes=retrieved_nodes,
+                    top_n=3
+                )
+                debug_reranked_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+            else:
+                retrieved_nodes = retrieved_nodes[:3]
+
+            # Filter low-score results when reranking
+            if use_rerank:
+                filtered_nodes = [
+                    node for node in retrieved_nodes
+                    if node.score is not None and node.score >= MIN_RERANK_SCORE_THRESHOLD
+                ]
+                if not filtered_nodes and retrieved_nodes:
+                    filtered_nodes = [retrieved_nodes[0]]
+                retrieved_nodes = filtered_nodes
+        else:
+            from .reranker import rerank_results
+
+            vector_retriever = index.as_retriever(similarity_top_k=20)
+            retrieved_nodes = vector_retriever.retrieve(question)
+            debug_vector_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+
+            if use_rerank:
+                retrieved_nodes = rerank_results(
+                    query=question,
+                    nodes=retrieved_nodes,
+                    top_n=3
+                )
+                debug_reranked_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+
+                filtered_nodes = [
+                    node for node in retrieved_nodes
+                    if node.score is not None and node.score >= MIN_RERANK_SCORE_THRESHOLD
+                ]
+                if not filtered_nodes and retrieved_nodes:
+                    filtered_nodes = [retrieved_nodes[0]]
+                retrieved_nodes = filtered_nodes
+            else:
+                retrieved_nodes = retrieved_nodes[:3]
+
+        # Collect final results debug info
+        debug_final_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+
+        # Build LLM input context for debug display
+        context_parts = []
+        for i, node_with_score in enumerate(retrieved_nodes):
+            context_parts.append(f"[Document {i+1}]\n{node_with_score.node.text}")
+        debug_llm_input = f"Question: {question}\n\n---\nContext:\n" + "\n\n---\n".join(context_parts)
+
+        # Extract source information
+        source_chunks = []
+        source_files = []
+        scores = []
+
+        for node_with_score in retrieved_nodes:
+            node = node_with_score.node
+            source_chunks.append(node.text)
+            scores.append(node_with_score.score if node_with_score.score is not None else 0.0)
+            if "filename" in node.metadata:
+                source_files.append(node.metadata["filename"])
+            else:
+                source_files.append("Unknown")
+
+        # Create streaming response synthesizer
+        from llama_index.core import get_response_synthesizer
+
+        llm = get_llm()
+        synthesizer = get_response_synthesizer(
+            response_mode=ResponseMode.COMPACT,
+            llm=llm,
+            streaming=True
+        )
+
+        # Get streaming response
+        streaming_response = synthesizer.synthesize(
+            query=question,
+            nodes=retrieved_nodes
+        )
+
+        # Stream the response tokens
+        full_response = ""
+        for text in streaming_response.response_gen:
+            full_response += text
+            yield (full_response, None)
+
+        # Add final metrics to parent span
+        add_span_attributes(parent_span, {
+            "retrieved_count": len(debug_hybrid_results) if use_hybrid else len(debug_vector_results),
+            "final_count": len(source_chunks),
+            "source_files": ", ".join(set(source_files)),
+            "answer_length": len(full_response),
+        })
+
+        # Set output for Phoenix UI
+        answer_preview = full_response[:200] + "..." if len(full_response) > 200 else full_response
+        set_span_output(parent_span, answer_preview)
+
+        # Create debug info object
+        debug_info = DebugInfo(
+            vector_results=debug_vector_results,
+            hybrid_results=debug_hybrid_results,
+            reranked_results=debug_reranked_results,
+            final_results=debug_final_results,
+            llm_input=debug_llm_input
+        )
+
+        # Yield final result
+        final_result = QueryResult(
+            answer=full_response,
+            source_chunks=source_chunks,
+            source_files=source_files,
+            scores=scores,
+            debug_info=debug_info,
+        )
+
+        yield (full_response, final_result)
