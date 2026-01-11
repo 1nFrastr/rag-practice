@@ -143,7 +143,8 @@ def chat_stream(
     chat_history: ChatHistory,
     use_hybrid: bool = False,
     use_rerank: bool = False,
-    enable_rewrite: bool = True
+    enable_rewrite: bool = True,
+    use_decompose: bool = False
 ) -> Generator[Tuple[str, QueryResult | None, str | None], None, None]:
     """
     Chat with streaming response, supporting multi-turn conversation.
@@ -154,6 +155,7 @@ def chat_stream(
         use_hybrid: If True, use hybrid search (BM25 + Vector)
         use_rerank: If True, use Cohere reranking
         enable_rewrite: If True, rewrite query based on history
+        use_decompose: If True, decompose complex queries into sub-queries
         
     Yields:
         Tuple of (partial_answer, final_result, rewritten_query)
@@ -168,6 +170,7 @@ def chat_stream(
             "use_hybrid": use_hybrid,
             "use_rerank": use_rerank,
             "enable_rewrite": enable_rewrite,
+            "use_decompose": use_decompose,
             "history_turns": len(chat_history.messages) // 2
         }
     ):
@@ -190,7 +193,8 @@ def chat_stream(
         for partial_answer, result in query_stream(
             search_query,
             use_hybrid=use_hybrid,
-            use_rerank=use_rerank
+            use_rerank=use_rerank,
+            use_decompose=use_decompose
         ):
             full_response = partial_answer
             if result is not None:

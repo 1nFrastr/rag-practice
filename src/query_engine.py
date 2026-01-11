@@ -30,6 +30,8 @@ class DebugInfo:
     final_results: List[dict]  # [{filename, score, text_preview, chunk_id}]
     # The actual prompt/context sent to LLM
     llm_input: str
+    # Query decomposition info (if enabled)
+    decomposition_info: dict = None  # {original, sub_queries, type, entities}
 
 
 @dataclass
@@ -69,7 +71,8 @@ def create_query_engine(index: VectorStoreIndex, similarity_top_k: int = 3):
 def query(
     question: str,
     use_hybrid: bool = False,
-    use_rerank: bool = False
+    use_rerank: bool = False,
+    use_decompose: bool = False
 ) -> QueryResult:
     """
     Query the indexed documents.
@@ -78,6 +81,7 @@ def query(
         question: User's question
         use_hybrid: If True, use hybrid search (BM25 + Vector)
         use_rerank: If True, use Cohere reranking
+        use_decompose: If True, decompose complex queries into sub-queries
 
     Returns:
         QueryResult with answer and source information
@@ -89,6 +93,7 @@ def query(
         attributes={
             "use_hybrid": use_hybrid,
             "use_rerank": use_rerank,
+            "use_decompose": use_decompose,
             "search_mode": "hybrid" if use_hybrid else "vector"
         }
     ) as parent_span:
@@ -96,6 +101,19 @@ def query(
 
         # Get existing index
         index = get_existing_index()
+        
+        # Query decomposition
+        decomposition_info = None
+        if use_decompose:
+            from .query_decomposer import decompose_query, merge_retrieval_results
+            decomposed = decompose_query(question)
+            if decomposed.is_decomposed:
+                decomposition_info = {
+                    "original": decomposed.original_query,
+                    "sub_queries": decomposed.sub_queries,
+                    "type": decomposed.decomposition_type,
+                    "entities": decomposed.entities
+                }
 
         # Helper function to extract node info for debug
         def _node_to_debug_dict(node_with_score, max_preview_len=100):
@@ -115,8 +133,39 @@ def query(
         debug_final_results = []
         debug_llm_input = ""
         
+        # Helper function for retrieval (supports both single and multi-query)
+        def _retrieve_nodes(query_text: str, top_k: int = 20):
+            """Retrieve nodes for a single query."""
+            if use_hybrid:
+                from .hybrid_search import hybrid_search
+                return hybrid_search(index=index, query=query_text, top_k=top_k, use_hybrid=True)
+            else:
+                vector_retriever = index.as_retriever(similarity_top_k=top_k)
+                return vector_retriever.retrieve(query_text)
+        
         # Determine retrieval strategy
-        if use_hybrid:
+        if decomposition_info and decomposition_info.get("sub_queries"):
+            # Multi-query retrieval for decomposed queries
+            from .query_decomposer import merge_retrieval_results
+            
+            all_sub_results = []
+            for sub_query in decomposition_info["sub_queries"]:
+                sub_nodes = _retrieve_nodes(sub_query, top_k=10)
+                all_sub_results.append(sub_nodes)
+            
+            # Merge results using RRF
+            retrieved_nodes = merge_retrieval_results(
+                all_sub_results,
+                strategy="rrf",
+                max_per_query=8
+            )
+            
+            # Collect debug info
+            if use_hybrid:
+                debug_hybrid_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+            else:
+                debug_vector_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+        elif use_hybrid:
             # Use hybrid search
             from .hybrid_search import hybrid_search
             from .reranker import rerank_results
@@ -210,7 +259,8 @@ def query(
                 hybrid_results=debug_hybrid_results,
                 reranked_results=debug_reranked_results,
                 final_results=debug_final_results,
-                llm_input=debug_llm_input
+                llm_input=debug_llm_input,
+                decomposition_info=decomposition_info
             )
             
             return QueryResult(
@@ -303,7 +353,8 @@ def query(
                 hybrid_results=[],  # No hybrid search in this mode
                 reranked_results=debug_reranked_results if use_rerank else [],
                 final_results=debug_final_results,
-                llm_input=debug_llm_input
+                llm_input=debug_llm_input,
+                decomposition_info=decomposition_info
             )
 
             return QueryResult(
@@ -318,7 +369,8 @@ def query(
 def query_stream(
     question: str,
     use_hybrid: bool = False,
-    use_rerank: bool = False
+    use_rerank: bool = False,
+    use_decompose: bool = False
 ) -> Generator[Tuple[str, QueryResult | None], None, None]:
     """
     Query the indexed documents with streaming response.
@@ -327,6 +379,7 @@ def query_stream(
         question: User's question
         use_hybrid: If True, use hybrid search (BM25 + Vector)
         use_rerank: If True, use Cohere reranking
+        use_decompose: If True, decompose complex queries into sub-queries
 
     Yields:
         Tuple of (partial_answer, final_result)
@@ -340,6 +393,7 @@ def query_stream(
         attributes={
             "use_hybrid": use_hybrid,
             "use_rerank": use_rerank,
+            "use_decompose": use_decompose,
             "search_mode": "hybrid" if use_hybrid else "vector",
             "streaming": True
         }
@@ -348,6 +402,19 @@ def query_stream(
 
         # Get existing index
         index = get_existing_index()
+        
+        # Query decomposition
+        decomposition_info = None
+        if use_decompose:
+            from .query_decomposer import decompose_query, merge_retrieval_results
+            decomposed = decompose_query(question)
+            if decomposed.is_decomposed:
+                decomposition_info = {
+                    "original": decomposed.original_query,
+                    "sub_queries": decomposed.sub_queries,
+                    "type": decomposed.decomposition_type,
+                    "entities": decomposed.entities
+                }
 
         # Helper function to extract node info for debug
         def _node_to_debug_dict(node_with_score, max_preview_len=100):
@@ -359,6 +426,15 @@ def query_stream(
             chunk_id = chunk_hash[:8] if chunk_hash else node.node_id[:8]
             score = node_with_score.score if node_with_score.score is not None else 0.0
             return {"filename": filename, "score": score, "text_preview": preview, "chunk_id": chunk_id}
+        
+        # Helper function for retrieval
+        def _retrieve_nodes(query_text: str, top_k: int = 20):
+            if use_hybrid:
+                from .hybrid_search import hybrid_search
+                return hybrid_search(index=index, query=query_text, top_k=top_k, use_hybrid=True)
+            else:
+                vector_retriever = index.as_retriever(similarity_top_k=top_k)
+                return vector_retriever.retrieve(query_text)
 
         # Initialize debug info
         debug_hybrid_results = []
@@ -368,7 +444,28 @@ def query_stream(
         debug_llm_input = ""
 
         # Retrieve nodes based on strategy
-        if use_hybrid:
+        if decomposition_info and decomposition_info.get("sub_queries"):
+            # Multi-query retrieval for decomposed queries
+            from .query_decomposer import merge_retrieval_results
+            
+            all_sub_results = []
+            for sub_query in decomposition_info["sub_queries"]:
+                sub_nodes = _retrieve_nodes(sub_query, top_k=10)
+                all_sub_results.append(sub_nodes)
+            
+            # Merge results using RRF
+            retrieved_nodes = merge_retrieval_results(
+                all_sub_results,
+                strategy="rrf",
+                max_per_query=8
+            )
+            
+            # Collect debug info
+            if use_hybrid:
+                debug_hybrid_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+            else:
+                debug_vector_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+        elif use_hybrid:
             from .hybrid_search import hybrid_search
             from .reranker import rerank_results
 
@@ -487,7 +584,8 @@ def query_stream(
             hybrid_results=debug_hybrid_results,
             reranked_results=debug_reranked_results,
             final_results=debug_final_results,
-            llm_input=debug_llm_input
+            llm_input=debug_llm_input,
+            decomposition_info=decomposition_info
         )
 
         # Yield final result

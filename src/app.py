@@ -76,6 +76,20 @@ def _format_debug_info(result, show_debug: bool) -> str:
     
     debug_parts = []
     
+    # Query decomposition info
+    if result.debug_info.decomposition_info:
+        decomp = result.debug_info.decomposition_info
+        debug_parts.append("## 🔀 查询分解 (Query Decomposition)")
+        debug_parts.append(f"**类型**: `{decomp.get('type', 'unknown')}`\n")
+        if decomp.get('entities'):
+            debug_parts.append(f"**识别实体**: {', '.join(decomp['entities'])}\n")
+        debug_parts.append("**子查询**:")
+        for i, sq in enumerate(decomp.get('sub_queries', []), 1):
+            debug_parts.append(f"  {i}. {sq}")
+        debug_parts.append("")
+        debug_parts.append("---")
+        debug_parts.append("")
+    
     # First stage: Hybrid search or Vector search results
     if result.debug_info.hybrid_results:
         debug_parts.append("## 🔍 混合检索结果 (Hybrid Search)")
@@ -136,6 +150,7 @@ def handle_query(
     question: str,
     use_hybrid: bool = False,
     use_rerank: bool = False,
+    use_decompose: bool = False,
     show_debug: bool = False
 ) -> Tuple[str, str, str]:
     """
@@ -145,6 +160,7 @@ def handle_query(
         question: User's question
         use_hybrid: If True, use hybrid search (BM25 + Vector)
         use_rerank: If True, use Cohere reranking
+        use_decompose: If True, decompose complex queries into sub-queries
         show_debug: If True, return debug information
 
     Returns:
@@ -154,7 +170,7 @@ def handle_query(
         return "请输入问题。", "", ""
 
     try:
-        result = query(question, use_hybrid=use_hybrid, use_rerank=use_rerank)
+        result = query(question, use_hybrid=use_hybrid, use_rerank=use_rerank, use_decompose=use_decompose)
         sources_text = _format_sources(result)
         debug_text = _format_debug_info(result, show_debug)
         return result.answer, sources_text, debug_text
@@ -166,6 +182,7 @@ def handle_query_stream(
     question: str,
     use_hybrid: bool = False,
     use_rerank: bool = False,
+    use_decompose: bool = False,
     show_debug: bool = False
 ) -> Generator[Tuple[str, str, str], None, None]:
     """
@@ -175,6 +192,7 @@ def handle_query_stream(
         question: User's question
         use_hybrid: If True, use hybrid search (BM25 + Vector)
         use_rerank: If True, use Cohere reranking
+        use_decompose: If True, decompose complex queries into sub-queries
         show_debug: If True, return debug information
 
     Yields:
@@ -191,7 +209,8 @@ def handle_query_stream(
         for partial_answer, final_result in query_stream(
             question, 
             use_hybrid=use_hybrid, 
-            use_rerank=use_rerank
+            use_rerank=use_rerank,
+            use_decompose=use_decompose
         ):
             if final_result is not None:
                 # Final result - format sources and debug info
@@ -263,6 +282,11 @@ def create_app() -> gr.Blocks:
                     value=False,
                     info="开启后使用Cohere Rerank API对检索结果进行重排序（需要COHERE_API_KEY）"
                 )
+                decompose_checkbox = gr.Checkbox(
+                    label="🔀 查询分解",
+                    value=False,
+                    info="自动分解多实体/比较类问题为子查询，如'A和B的共同点'"
+                )
                 debug_checkbox = gr.Checkbox(
                     label="🐛 显示调试信息",
                     value=True,
@@ -288,14 +312,14 @@ def create_app() -> gr.Blocks:
             # Use streaming response for better UX
             ask_btn.click(
                 fn=handle_query_stream,
-                inputs=[question_input, hybrid_search_checkbox, rerank_checkbox, debug_checkbox],
+                inputs=[question_input, hybrid_search_checkbox, rerank_checkbox, decompose_checkbox, debug_checkbox],
                 outputs=[answer_output, sources_output, debug_output],
             )
 
             # Also trigger on Enter key with streaming
             question_input.submit(
                 fn=handle_query_stream,
-                inputs=[question_input, hybrid_search_checkbox, rerank_checkbox, debug_checkbox],
+                inputs=[question_input, hybrid_search_checkbox, rerank_checkbox, decompose_checkbox, debug_checkbox],
                 outputs=[answer_output, sources_output, debug_output],
             )
 
@@ -321,6 +345,11 @@ def create_app() -> gr.Blocks:
                     label="🔄 查询改写",
                     value=True,
                     info="基于对话历史自动改写查询，解决代词指代问题"
+                )
+                chat_decompose_checkbox = gr.Checkbox(
+                    label="🔀 查询分解",
+                    value=False,
+                    info="自动分解多实体/比较类问题为子查询"
                 )
             
             # State to store chat history
@@ -355,7 +384,8 @@ def create_app() -> gr.Blocks:
                 chat_hist_obj: ChatHistory,
                 use_hybrid: bool,
                 use_rerank: bool,
-                enable_rewrite: bool
+                enable_rewrite: bool,
+                use_decompose: bool
             ) -> Generator[Tuple[list, ChatHistory, str], None, None]:
                 """Handle chat message with streaming."""
                 if not message.strip():
@@ -383,7 +413,8 @@ def create_app() -> gr.Blocks:
                         chat_hist_obj,
                         use_hybrid=use_hybrid,
                         use_rerank=use_rerank,
-                        enable_rewrite=enable_rewrite
+                        enable_rewrite=enable_rewrite,
+                        use_decompose=use_decompose
                     ):
                         # Update the last message with streaming content
                         history[-1] = {"role": "assistant", "content": partial_answer}
@@ -416,7 +447,7 @@ def create_app() -> gr.Blocks:
             # Wire up events
             chat_submit_btn.click(
                 fn=handle_chat_message,
-                inputs=[chat_input, chatbot, chat_history_state, chat_hybrid_checkbox, chat_rerank_checkbox, chat_rewrite_checkbox],
+                inputs=[chat_input, chatbot, chat_history_state, chat_hybrid_checkbox, chat_rerank_checkbox, chat_rewrite_checkbox, chat_decompose_checkbox],
                 outputs=[chatbot, chat_history_state, rewrite_info],
             ).then(
                 fn=lambda: "",
@@ -426,7 +457,7 @@ def create_app() -> gr.Blocks:
             
             chat_input.submit(
                 fn=handle_chat_message,
-                inputs=[chat_input, chatbot, chat_history_state, chat_hybrid_checkbox, chat_rerank_checkbox, chat_rewrite_checkbox],
+                inputs=[chat_input, chatbot, chat_history_state, chat_hybrid_checkbox, chat_rerank_checkbox, chat_rewrite_checkbox, chat_decompose_checkbox],
                 outputs=[chatbot, chat_history_state, rewrite_info],
             ).then(
                 fn=lambda: "",
