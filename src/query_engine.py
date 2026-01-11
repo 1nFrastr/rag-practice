@@ -145,13 +145,24 @@ def query(
         
         # Determine retrieval strategy
         if decomposition_info and decomposition_info.get("sub_queries"):
-            # Multi-query retrieval for decomposed queries
+            # Multi-query retrieval for decomposed queries (PARALLEL)
             from .query_decomposer import merge_retrieval_results
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            all_sub_results = []
-            for sub_query in decomposition_info["sub_queries"]:
-                sub_nodes = _retrieve_nodes(sub_query, top_k=10)
-                all_sub_results.append(sub_nodes)
+            sub_queries = decomposition_info["sub_queries"]
+            all_sub_results = [None] * len(sub_queries)  # Pre-allocate to maintain order
+            
+            # Parallel retrieval using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(4, len(sub_queries))) as executor:
+                # Submit all tasks
+                future_to_idx = {
+                    executor.submit(_retrieve_nodes, sq, 10): idx 
+                    for idx, sq in enumerate(sub_queries)
+                }
+                # Collect results maintaining order
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    all_sub_results[idx] = future.result()
             
             # Merge results using RRF
             retrieved_nodes = merge_retrieval_results(
@@ -445,13 +456,24 @@ def query_stream(
 
         # Retrieve nodes based on strategy
         if decomposition_info and decomposition_info.get("sub_queries"):
-            # Multi-query retrieval for decomposed queries
+            # Multi-query retrieval for decomposed queries (PARALLEL)
             from .query_decomposer import merge_retrieval_results
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            all_sub_results = []
-            for sub_query in decomposition_info["sub_queries"]:
-                sub_nodes = _retrieve_nodes(sub_query, top_k=10)
-                all_sub_results.append(sub_nodes)
+            sub_queries = decomposition_info["sub_queries"]
+            all_sub_results = [None] * len(sub_queries)  # Pre-allocate to maintain order
+            
+            # Parallel retrieval using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(4, len(sub_queries))) as executor:
+                # Submit all tasks
+                future_to_idx = {
+                    executor.submit(_retrieve_nodes, sq, 10): idx 
+                    for idx, sq in enumerate(sub_queries)
+                }
+                # Collect results maintaining order
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    all_sub_results[idx] = future.result()
             
             # Merge results using RRF
             retrieved_nodes = merge_retrieval_results(
