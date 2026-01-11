@@ -1,12 +1,42 @@
 """Reranking module using Cohere Rerank API."""
 
-from typing import List, Optional
+import json
+from typing import Any, Dict, List, Optional
 
 import cohere
 from llama_index.core.schema import NodeWithScore
-
+from openinference.instrumentation import get_reranker_attributes
+from openinference.instrumentation._types import Document
 from .config import config
 from .tracing import traced_operation, add_span_attributes, set_span_output, SpanKind
+
+
+def _nodes_to_documents(
+    nodes: List[NodeWithScore],
+    include_score: bool = False
+) -> List[Document]:
+    """
+    Convert NodeWithScore objects to OpenInference Document format.
+    
+    Document TypedDict has keys: content, id, metadata, score
+    """
+    documents: List[Document] = []
+    for i, node in enumerate(nodes):
+        doc: Document = {
+            "content": node.node.text[:500],  # Truncate for display
+            "id": node.node.node_id or f"doc_{i}",
+        }
+        if include_score and node.score is not None:
+            doc["score"] = float(node.score)
+        
+        # Include key metadata
+        if node.node.metadata:
+            filename = node.node.metadata.get("filename", "")
+            if filename:
+                doc["metadata"] = json.dumps({"filename": filename})
+        
+        documents.append(doc)
+    return documents
 
 
 def rerank_results(
@@ -28,19 +58,24 @@ def rerank_results(
         Reranked list of NodeWithScore objects (top_n results)
     """
     # Build input summary for tracing
-    input_files = [n.node.metadata.get("filename", "?") for n in nodes[:5]]
     input_summary = f"Query: {query}\nCandidates: {len(nodes)} docs"
+    
+    # Format input documents for Phoenix tracing (using OpenInference format)
+    input_docs = _nodes_to_documents(nodes, include_score=True)
+    
+    # Use get_reranker_attributes to generate proper flattened attributes
+    reranker_attrs = get_reranker_attributes(
+        query=query,
+        model_name=model,
+        top_k=top_n,
+        input_documents=input_docs,
+    )
     
     with traced_operation(
         "cohere_rerank",
         span_kind=SpanKind.RERANKER,
         input_value=input_summary,
-        attributes={
-            "reranker.query": query,
-            "reranker.model_name": model,
-            "reranker.top_k": top_n,
-            "candidate_count": len(nodes),
-        }
+        attributes=reranker_attrs,
     ) as span:
         if not nodes:
             add_span_attributes(span, {"status": "empty_input"})
@@ -103,6 +138,12 @@ def rerank_results(
                         )
                     )
             
+            # Format output documents for Phoenix tracing (using OpenInference format)
+            output_docs = _nodes_to_documents(reranked_nodes, include_score=True)
+            
+            # Use get_reranker_attributes to generate proper flattened output document attributes
+            output_attrs = get_reranker_attributes(output_documents=output_docs)
+            
             # Add detailed rerank metrics to span
             add_span_attributes(span, {
                 "status": "success",
@@ -111,6 +152,7 @@ def rerank_results(
                 "min_score": min(scores) if scores else 0.0,
                 "avg_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
                 "rank_changes": str(rank_changes),
+                **output_attrs,
             })
             
             # Set output for Phoenix UI
