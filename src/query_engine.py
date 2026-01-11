@@ -85,11 +85,10 @@ def query(
     with traced_operation(
         "rag_query",
         {
-            "question": question,
-            "use_hybrid": use_hybrid,
-            "use_rerank": use_rerank,
-            "search_mode": "hybrid" if use_hybrid else "vector",
-            "rerank_enabled": use_rerank
+            "input.question": question,
+            "param.use_hybrid": use_hybrid,
+            "param.use_rerank": use_rerank,
+            "param.search_mode": "hybrid" if use_hybrid else "vector"
         }
     ) as parent_span:
         config.validate()
@@ -194,9 +193,11 @@ def query(
             
             # Add final metrics to parent span
             add_span_attributes(parent_span, {
-                "retrieved_count": len(debug_hybrid_results),
-                "final_count": len(source_chunks),
-                "source_files": ", ".join(set(source_files))
+                "output.retrieved_count": len(debug_hybrid_results),
+                "output.final_count": len(source_chunks),
+                "output.source_files": ", ".join(set(source_files)),
+                "output.answer_length": len(str(response)),
+                "output.context_chunks": len(retrieved_nodes)
             })
             
             # Create debug info object
@@ -283,9 +284,11 @@ def query(
             
             # Add final metrics to parent span
             add_span_attributes(parent_span, {
-                "retrieved_count": len(debug_vector_results),
-                "final_count": len(source_chunks),
-                "source_files": ", ".join(set(source_files))
+                "output.retrieved_count": len(debug_vector_results),
+                "output.final_count": len(source_chunks),
+                "output.source_files": ", ".join(set(source_files)),
+                "output.answer_length": len(str(response)),
+                "output.context_chunks": len(retrieved_nodes)
             })
             
             debug_info = DebugInfo(

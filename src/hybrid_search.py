@@ -8,7 +8,7 @@ from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import NodeWithScore
 
 from .config import config
-from .tracing import traced_operation, add_span_attributes
+from .tracing import traced_operation, add_span_attributes, format_results_for_trace
 
 
 def get_db_connection():
@@ -94,7 +94,11 @@ def bm25_search(query: str, top_k: int = 20) -> List[Tuple[str, float]]:
     """
     with traced_operation(
         "bm25_search",
-        {"query": query, "top_k": top_k, "search_type": "fulltext"}
+        {
+            "input.query": query,
+            "input.top_k": top_k,
+            "search_type": "postgresql_fulltext"
+        }
     ) as span:
         # PGVectorStore uses "data_<table_name>" as the actual table name
         table_name = "data_documents"
@@ -115,16 +119,26 @@ def bm25_search(query: str, top_k: int = 20) -> List[Tuple[str, float]]:
                 results = cur.fetchall()
                 result_list = [(row[0], float(row[1])) for row in results]
                 
-                # Add result metrics to span
+                # Add detailed result metrics to span
+                scores = [r[1] for r in result_list]
+                node_ids = [r[0][:8] + "..." for r in result_list[:5]]  # Truncate for display
+                
                 add_span_attributes(span, {
-                    "result_count": len(result_list),
-                    "top_score": result_list[0][1] if result_list else 0.0
+                    "output.result_count": len(result_list),
+                    "output.top_score": scores[0] if scores else 0.0,
+                    "output.min_score": min(scores) if scores else 0.0,
+                    "output.avg_score": sum(scores) / len(scores) if scores else 0.0,
+                    "output.top_node_ids": str(node_ids),
+                    "output.scores": str([round(s, 4) for s in scores[:5]])
                 })
                 
                 return result_list
         except Exception as e:
             print(f"Error in BM25 search: {e}")
-            add_span_attributes(span, {"error": str(e)})
+            add_span_attributes(span, {
+                "error": str(e),
+                "output.result_count": 0
+            })
             return []
         finally:
             conn.close()
@@ -149,9 +163,9 @@ def reciprocal_rank_fusion(
     with traced_operation(
         "reciprocal_rank_fusion",
         {
-            "vector_result_count": len(vector_results),
-            "bm25_result_count": len(bm25_results),
-            "rrf_k": k
+            "input.vector_count": len(vector_results),
+            "input.bm25_count": len(bm25_results),
+            "param.rrf_k": k
         }
     ) as span:
         # Create node_id to NodeWithScore mapping from vector results
@@ -166,11 +180,13 @@ def reciprocal_rank_fusion(
             rrf_scores[node_id] += 1.0 / (k + rank)
         
         # Add BM25 search scores
+        bm25_only_count = 0
         for rank, (node_id, _) in enumerate(bm25_results, start=1):
             rrf_scores[node_id] += 1.0 / (k + rank)
             # If node_id not in vector results, we need to fetch it from DB
             if node_id not in node_map:
                 node_map[node_id] = _fetch_node_from_db(node_id)
+                bm25_only_count += 1
         
         # Sort by RRF score (descending)
         sorted_nodes = sorted(
@@ -192,11 +208,20 @@ def reciprocal_rank_fusion(
                     )
                 )
         
-        # Add fusion metrics to span
+        # Format top results for trace
+        top_results = []
+        for i, node in enumerate(result[:5]):
+            filename = node.node.metadata.get("filename", "unknown")
+            top_results.append(f"[{i+1}] {filename}: rrf_score={node.score:.4f}")
+        
+        # Add detailed fusion metrics to span
         add_span_attributes(span, {
-            "unique_documents": len(rrf_scores),
-            "fused_result_count": len(result),
-            "top_rrf_score": result[0].score if result else 0.0
+            "output.unique_documents": len(rrf_scores),
+            "output.fused_count": len(result),
+            "output.bm25_only_docs": bm25_only_count,
+            "output.top_rrf_score": result[0].score if result else 0.0,
+            "output.min_rrf_score": result[-1].score if result else 0.0,
+            "output.top_results": "\n".join(top_results)
         })
         
         return result
@@ -264,10 +289,10 @@ def hybrid_search(
     with traced_operation(
         "hybrid_search",
         {
-            "query": query,
-            "top_k": top_k,
-            "use_hybrid": use_hybrid,
-            "search_mode": "hybrid" if use_hybrid else "vector_only"
+            "input.query": query,
+            "input.top_k": top_k,
+            "param.use_hybrid": use_hybrid,
+            "param.search_mode": "hybrid" if use_hybrid else "vector_only"
         }
     ) as span:
         # Note: fulltext index should be created/updated during indexing, not during query
@@ -277,22 +302,29 @@ def hybrid_search(
         vector_retriever = index.as_retriever(similarity_top_k=top_k)
         vector_results = vector_retriever.retrieve(query)
         
-        add_span_attributes(span, {"vector_result_count": len(vector_results)})
+        # Record vector search results
+        vector_filenames = [n.node.metadata.get("filename", "?") for n in vector_results[:5]]
+        add_span_attributes(span, {
+            "stage1.vector_count": len(vector_results),
+            "stage1.vector_top_files": str(vector_filenames)
+        })
         
         if not use_hybrid:
-            add_span_attributes(span, {"final_result_count": len(vector_results)})
+            # Format final results
+            result_attrs = format_results_for_trace(vector_results[:top_k])
+            add_span_attributes(span, result_attrs)
             return vector_results
         
         # Perform BM25 search
         bm25_results = bm25_search(query, top_k=top_k)
         
-        add_span_attributes(span, {"bm25_result_count": len(bm25_results)})
+        add_span_attributes(span, {"stage2.bm25_count": len(bm25_results)})
         
         if not bm25_results:
             # If BM25 returns no results, fall back to vector search
             add_span_attributes(span, {
-                "fallback": "vector_only",
-                "final_result_count": len(vector_results)
+                "fallback": "vector_only_no_bm25_match",
+                "output.result_count": len(vector_results)
             })
             return vector_results
         
@@ -304,7 +336,18 @@ def hybrid_search(
         )
         
         final_results = combined_results[:top_k]
-        add_span_attributes(span, {"final_result_count": len(final_results)})
+        
+        # Format final results for trace
+        top_results = []
+        for i, node in enumerate(final_results[:5]):
+            filename = node.node.metadata.get("filename", "unknown")
+            text_preview = node.node.text[:50] + "..." if len(node.node.text) > 50 else node.node.text
+            top_results.append(f"[{i+1}] {filename} (score={node.score:.4f}): {text_preview}")
+        
+        add_span_attributes(span, {
+            "output.result_count": len(final_results),
+            "output.top_results": "\n".join(top_results)
+        })
         
         # Return top_k results
         return final_results

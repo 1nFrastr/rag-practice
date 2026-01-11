@@ -27,27 +27,34 @@ def rerank_results(
     Returns:
         Reranked list of NodeWithScore objects (top_n results)
     """
+    # Build input summary for tracing
+    input_files = [n.node.metadata.get("filename", "?") for n in nodes[:5]]
+    
     with traced_operation(
         "cohere_rerank",
         {
-            "query": query,
-            "input_count": len(nodes),
-            "top_n": top_n,
-            "model": model
+            "input.query": query,
+            "input.candidate_count": len(nodes),
+            "input.top_files": str(input_files),
+            "param.top_n": top_n,
+            "param.model": model
         }
     ) as span:
         if not nodes:
-            add_span_attributes(span, {"status": "empty_input", "output_count": 0})
+            add_span_attributes(span, {
+                "status": "empty_input",
+                "output.result_count": 0
+            })
             return []
         
         if not config.COHERE_API_KEY:
             # If API key is not set, return original results
+            fallback_results = nodes[:top_n]
             add_span_attributes(span, {
-                "status": "no_api_key",
-                "fallback": "original_order",
-                "output_count": min(top_n, len(nodes))
+                "status": "no_api_key_fallback",
+                "output.result_count": len(fallback_results)
             })
-            return nodes[:top_n]
+            return fallback_results
         
         try:
             # Initialize Cohere client
@@ -68,12 +75,28 @@ def rerank_results(
             # Map reranked results back to NodeWithScore objects
             reranked_nodes = []
             scores = []
-            for result in response.results:
-                index = result.index
-                if 0 <= index < len(nodes):
-                    original_node = nodes[index]
+            rank_changes = []
+            output_details = []
+            
+            for new_rank, result in enumerate(response.results):
+                old_index = result.index
+                if 0 <= old_index < len(nodes):
+                    original_node = nodes[old_index]
                     relevance_score = float(result.relevance_score)
                     scores.append(relevance_score)
+                    
+                    # Track rank change
+                    rank_change = old_index - new_rank  # positive = moved up
+                    rank_changes.append(f"{old_index}→{new_rank}")
+                    
+                    # Build output detail
+                    filename = original_node.node.metadata.get("filename", "unknown")
+                    score_pct = relevance_score * 100
+                    text_preview = original_node.node.text[:40].replace("\n", " ")
+                    output_details.append(
+                        f"[{new_rank+1}] {filename} ({score_pct:.1f}%): {text_preview}..."
+                    )
+                    
                     # Create new NodeWithScore with rerank score
                     reranked_nodes.append(
                         NodeWithScore(
@@ -82,24 +105,28 @@ def rerank_results(
                         )
                     )
             
-            # Add rerank metrics to span
+            # Add detailed rerank metrics to span
             add_span_attributes(span, {
                 "status": "success",
-                "output_count": len(reranked_nodes),
-                "top_score": max(scores) if scores else 0.0,
-                "min_score": min(scores) if scores else 0.0,
-                "avg_score": sum(scores) / len(scores) if scores else 0.0
+                "output.result_count": len(reranked_nodes),
+                "output.top_score": max(scores) if scores else 0.0,
+                "output.min_score": min(scores) if scores else 0.0,
+                "output.avg_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+                "output.scores": str([round(s, 4) for s in scores]),
+                "output.rank_changes": str(rank_changes),
+                "output.results": "\n".join(output_details)
             })
             
             return reranked_nodes
         
         except Exception as e:
             print(f"Error in Cohere reranking: {e}")
+            fallback_results = nodes[:top_n]
             add_span_attributes(span, {
                 "status": "error",
                 "error": str(e),
                 "fallback": "original_order",
-                "output_count": min(top_n, len(nodes))
+                "output.result_count": len(fallback_results)
             })
             # On error, return original top_n results
-            return nodes[:top_n]
+            return fallback_results
