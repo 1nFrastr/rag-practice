@@ -9,7 +9,7 @@ from llama_index.llms.openai_like import OpenAILike
 
 from .config import config
 from .indexer import get_existing_index
-from .tracing import traced_operation, add_span_attributes
+from .tracing import traced_operation, add_span_attributes, set_span_output, SpanKind
 
 # Minimum score threshold for reranked results
 # Results below this threshold will be filtered out before sending to LLM
@@ -84,11 +84,12 @@ def query(
     """
     with traced_operation(
         "rag_query",
-        {
-            "input.question": question,
-            "param.use_hybrid": use_hybrid,
-            "param.use_rerank": use_rerank,
-            "param.search_mode": "hybrid" if use_hybrid else "vector"
+        span_kind=SpanKind.CHAIN,
+        input_value=question,
+        attributes={
+            "use_hybrid": use_hybrid,
+            "use_rerank": use_rerank,
+            "search_mode": "hybrid" if use_hybrid else "vector"
         }
     ) as parent_span:
         config.validate()
@@ -193,12 +194,15 @@ def query(
             
             # Add final metrics to parent span
             add_span_attributes(parent_span, {
-                "output.retrieved_count": len(debug_hybrid_results),
-                "output.final_count": len(source_chunks),
-                "output.source_files": ", ".join(set(source_files)),
-                "output.answer_length": len(str(response)),
-                "output.context_chunks": len(retrieved_nodes)
+                "retrieved_count": len(debug_hybrid_results),
+                "final_count": len(source_chunks),
+                "source_files": ", ".join(set(source_files)),
+                "answer_length": len(str(response)),
             })
+            
+            # Set output for Phoenix UI
+            answer_preview = str(response)[:200] + "..." if len(str(response)) > 200 else str(response)
+            set_span_output(parent_span, answer_preview)
             
             # Create debug info object
             debug_info = DebugInfo(
@@ -284,12 +288,15 @@ def query(
             
             # Add final metrics to parent span
             add_span_attributes(parent_span, {
-                "output.retrieved_count": len(debug_vector_results),
-                "output.final_count": len(source_chunks),
-                "output.source_files": ", ".join(set(source_files)),
-                "output.answer_length": len(str(response)),
-                "output.context_chunks": len(retrieved_nodes)
+                "retrieved_count": len(debug_vector_results),
+                "final_count": len(source_chunks),
+                "source_files": ", ".join(set(source_files)),
+                "answer_length": len(str(response)),
             })
+            
+            # Set output for Phoenix UI
+            answer_preview = str(response)[:200] + "..." if len(str(response)) > 200 else str(response)
+            set_span_output(parent_span, answer_preview)
             
             debug_info = DebugInfo(
                 vector_results=debug_vector_results,  # Initial vector search results

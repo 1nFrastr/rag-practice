@@ -7,6 +7,23 @@ from typing import Any, Dict, List, Optional
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode, Span
 
+# OpenInference semantic conventions for Phoenix
+# See: https://github.com/Arize-ai/openinference
+OPENINFERENCE_SPAN_KIND = "openinference.span.kind"
+INPUT_VALUE = "input.value"
+INPUT_MIME_TYPE = "input.mime_type"
+OUTPUT_VALUE = "output.value"
+OUTPUT_MIME_TYPE = "output.mime_type"
+
+# Span kinds recognized by Phoenix
+class SpanKind:
+    CHAIN = "CHAIN"
+    RETRIEVER = "RETRIEVER"
+    RERANKER = "RERANKER"
+    LLM = "LLM"
+    EMBEDDING = "EMBEDDING"
+    TOOL = "TOOL"
+
 # Tracer instance for custom spans
 # Uses the same tracer provider configured in main.py via Phoenix
 _tracer: Optional[trace.Tracer] = None
@@ -28,6 +45,8 @@ def get_tracer() -> trace.Tracer:
 @contextmanager
 def traced_operation(
     name: str,
+    span_kind: str = SpanKind.CHAIN,
+    input_value: Optional[str] = None,
     attributes: Optional[Dict[str, Any]] = None,
     record_exception: bool = True
 ):
@@ -36,6 +55,8 @@ def traced_operation(
     
     Args:
         name: Name of the operation (will appear in Phoenix UI)
+        span_kind: OpenInference span kind (CHAIN, RETRIEVER, RERANKER, etc.)
+        input_value: Input value to display in Phoenix UI
         attributes: Optional dictionary of span attributes
         record_exception: Whether to record exceptions on the span
         
@@ -43,15 +64,23 @@ def traced_operation(
         The current span for adding additional attributes
         
     Example:
-        with traced_operation("bm25_search", {"query": query, "top_k": 10}) as span:
+        with traced_operation("bm25_search", SpanKind.RETRIEVER, query) as span:
             results = do_search()
-            span.set_attribute("result_count", len(results))
+            set_span_output(span, f"Found {len(results)} results")
     """
     tracer = get_tracer()
     start_time = time.perf_counter()
     
     with tracer.start_as_current_span(name) as span:
-        # Set initial attributes
+        # Set OpenInference span kind for Phoenix UI
+        span.set_attribute(OPENINFERENCE_SPAN_KIND, span_kind)
+        
+        # Set input value for Phoenix UI
+        if input_value:
+            span.set_attribute(INPUT_VALUE, input_value)
+            span.set_attribute(INPUT_MIME_TYPE, "text/plain")
+        
+        # Set additional attributes
         if attributes:
             for key, value in attributes.items():
                 _set_span_attribute(span, key, value)
@@ -69,6 +98,18 @@ def traced_operation(
             if record_exception:
                 span.record_exception(e)
             raise
+
+
+def set_span_output(span: Span, output_value: str) -> None:
+    """
+    Set the output value for a span (displayed in Phoenix UI output column).
+    
+    Args:
+        span: The span to set output on
+        output_value: The output value to display
+    """
+    span.set_attribute(OUTPUT_VALUE, output_value)
+    span.set_attribute(OUTPUT_MIME_TYPE, "text/plain")
 
 
 def _set_span_attribute(span: Span, key: str, value: Any) -> None:

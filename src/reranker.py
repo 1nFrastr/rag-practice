@@ -6,7 +6,7 @@ import cohere
 from llama_index.core.schema import NodeWithScore
 
 from .config import config
-from .tracing import traced_operation, add_span_attributes
+from .tracing import traced_operation, add_span_attributes, set_span_output, SpanKind
 
 
 def rerank_results(
@@ -29,31 +29,29 @@ def rerank_results(
     """
     # Build input summary for tracing
     input_files = [n.node.metadata.get("filename", "?") for n in nodes[:5]]
+    input_summary = f"Query: {query}\nCandidates: {len(nodes)} docs"
     
     with traced_operation(
         "cohere_rerank",
-        {
-            "input.query": query,
-            "input.candidate_count": len(nodes),
-            "input.top_files": str(input_files),
-            "param.top_n": top_n,
-            "param.model": model
+        span_kind=SpanKind.RERANKER,
+        input_value=input_summary,
+        attributes={
+            "reranker.query": query,
+            "reranker.model_name": model,
+            "reranker.top_k": top_n,
+            "candidate_count": len(nodes),
         }
     ) as span:
         if not nodes:
-            add_span_attributes(span, {
-                "status": "empty_input",
-                "output.result_count": 0
-            })
+            add_span_attributes(span, {"status": "empty_input"})
+            set_span_output(span, "No candidates to rerank")
             return []
         
         if not config.COHERE_API_KEY:
             # If API key is not set, return original results
             fallback_results = nodes[:top_n]
-            add_span_attributes(span, {
-                "status": "no_api_key_fallback",
-                "output.result_count": len(fallback_results)
-            })
+            add_span_attributes(span, {"status": "no_api_key_fallback"})
+            set_span_output(span, f"No API key - returning top {len(fallback_results)} original")
             return fallback_results
         
         try:
@@ -108,14 +106,16 @@ def rerank_results(
             # Add detailed rerank metrics to span
             add_span_attributes(span, {
                 "status": "success",
-                "output.result_count": len(reranked_nodes),
-                "output.top_score": max(scores) if scores else 0.0,
-                "output.min_score": min(scores) if scores else 0.0,
-                "output.avg_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
-                "output.scores": str([round(s, 4) for s in scores]),
-                "output.rank_changes": str(rank_changes),
-                "output.results": "\n".join(output_details)
+                "result_count": len(reranked_nodes),
+                "top_score": max(scores) if scores else 0.0,
+                "min_score": min(scores) if scores else 0.0,
+                "avg_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+                "rank_changes": str(rank_changes),
             })
+            
+            # Set output for Phoenix UI
+            output_summary = "\n".join(output_details)
+            set_span_output(span, output_summary)
             
             return reranked_nodes
         
@@ -125,8 +125,7 @@ def rerank_results(
             add_span_attributes(span, {
                 "status": "error",
                 "error": str(e),
-                "fallback": "original_order",
-                "output.result_count": len(fallback_results)
             })
+            set_span_output(span, f"Error: {str(e)} - fallback to original order")
             # On error, return original top_n results
             return fallback_results
