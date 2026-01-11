@@ -8,6 +8,7 @@ from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import NodeWithScore
 
 from .config import config
+from .tracing import traced_operation, add_span_attributes
 
 
 def get_db_connection():
@@ -91,29 +92,42 @@ def bm25_search(query: str, top_k: int = 20) -> List[Tuple[str, float]]:
     Returns:
         List of (node_id, score) tuples
     """
-    # PGVectorStore uses "data_<table_name>" as the actual table name
-    table_name = "data_documents"
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            # Use ts_rank_cd for BM25-like ranking
-            # ts_rank_cd uses cover density ranking which is similar to BM25
-            cur.execute(f"""
-                SELECT node_id, ts_rank_cd(text_tsvector, query, 32) as rank
-                FROM {table_name}, 
-                     to_tsquery('simple', regexp_replace(%s, '\s+', ' & ', 'g')) query
-                WHERE text_tsvector @@ query
-                ORDER BY rank DESC
-                LIMIT %s;
-            """, (query, top_k))
-            
-            results = cur.fetchall()
-            return [(row[0], float(row[1])) for row in results]
-    except Exception as e:
-        print(f"Error in BM25 search: {e}")
-        return []
-    finally:
-        conn.close()
+    with traced_operation(
+        "bm25_search",
+        {"query": query, "top_k": top_k, "search_type": "fulltext"}
+    ) as span:
+        # PGVectorStore uses "data_<table_name>" as the actual table name
+        table_name = "data_documents"
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # Use ts_rank_cd for BM25-like ranking
+                # ts_rank_cd uses cover density ranking which is similar to BM25
+                cur.execute(f"""
+                    SELECT node_id, ts_rank_cd(text_tsvector, query, 32) as rank
+                    FROM {table_name}, 
+                         to_tsquery('simple', regexp_replace(%s, '\s+', ' & ', 'g')) query
+                    WHERE text_tsvector @@ query
+                    ORDER BY rank DESC
+                    LIMIT %s;
+                """, (query, top_k))
+                
+                results = cur.fetchall()
+                result_list = [(row[0], float(row[1])) for row in results]
+                
+                # Add result metrics to span
+                add_span_attributes(span, {
+                    "result_count": len(result_list),
+                    "top_score": result_list[0][1] if result_list else 0.0
+                })
+                
+                return result_list
+        except Exception as e:
+            print(f"Error in BM25 search: {e}")
+            add_span_attributes(span, {"error": str(e)})
+            return []
+        finally:
+            conn.close()
 
 
 def reciprocal_rank_fusion(
@@ -132,45 +146,60 @@ def reciprocal_rank_fusion(
     Returns:
         Combined and ranked list of NodeWithScore
     """
-    # Create node_id to NodeWithScore mapping from vector results
-    node_map = {node.node.node_id: node for node in vector_results}
-    
-    # Build RRF scores
-    rrf_scores: Dict[str, float] = defaultdict(float)
-    
-    # Add vector search scores
-    for rank, node in enumerate(vector_results, start=1):
-        node_id = node.node.node_id
-        rrf_scores[node_id] += 1.0 / (k + rank)
-    
-    # Add BM25 search scores
-    for rank, (node_id, _) in enumerate(bm25_results, start=1):
-        rrf_scores[node_id] += 1.0 / (k + rank)
-        # If node_id not in vector results, we need to fetch it from DB
-        if node_id not in node_map:
-            node_map[node_id] = _fetch_node_from_db(node_id)
-    
-    # Sort by RRF score (descending)
-    sorted_nodes = sorted(
-        rrf_scores.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
-    
-    # Return NodeWithScore objects with RRF scores
-    result = []
-    for node_id, rrf_score in sorted_nodes:
-        if node_id in node_map:
-            node_with_score = node_map[node_id]
-            # Create new NodeWithScore with RRF score
-            result.append(
-                NodeWithScore(
-                    node=node_with_score.node,
-                    score=rrf_score
+    with traced_operation(
+        "reciprocal_rank_fusion",
+        {
+            "vector_result_count": len(vector_results),
+            "bm25_result_count": len(bm25_results),
+            "rrf_k": k
+        }
+    ) as span:
+        # Create node_id to NodeWithScore mapping from vector results
+        node_map = {node.node.node_id: node for node in vector_results}
+        
+        # Build RRF scores
+        rrf_scores: Dict[str, float] = defaultdict(float)
+        
+        # Add vector search scores
+        for rank, node in enumerate(vector_results, start=1):
+            node_id = node.node.node_id
+            rrf_scores[node_id] += 1.0 / (k + rank)
+        
+        # Add BM25 search scores
+        for rank, (node_id, _) in enumerate(bm25_results, start=1):
+            rrf_scores[node_id] += 1.0 / (k + rank)
+            # If node_id not in vector results, we need to fetch it from DB
+            if node_id not in node_map:
+                node_map[node_id] = _fetch_node_from_db(node_id)
+        
+        # Sort by RRF score (descending)
+        sorted_nodes = sorted(
+            rrf_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        # Return NodeWithScore objects with RRF scores
+        result = []
+        for node_id, rrf_score in sorted_nodes:
+            if node_id in node_map:
+                node_with_score = node_map[node_id]
+                # Create new NodeWithScore with RRF score
+                result.append(
+                    NodeWithScore(
+                        node=node_with_score.node,
+                        score=rrf_score
+                    )
                 )
-            )
-    
-    return result
+        
+        # Add fusion metrics to span
+        add_span_attributes(span, {
+            "unique_documents": len(rrf_scores),
+            "fused_result_count": len(result),
+            "top_rrf_score": result[0].score if result else 0.0
+        })
+        
+        return result
 
 
 def _fetch_node_from_db(node_id: str) -> NodeWithScore:
@@ -232,29 +261,50 @@ def hybrid_search(
     Returns:
         List of NodeWithScore objects
     """
-    # Note: fulltext index should be created/updated during indexing, not during query
-    # This avoids the expensive update_fulltext_index() call on every query
-    
-    # Get vector store retriever
-    vector_retriever = index.as_retriever(similarity_top_k=top_k)
-    vector_results = vector_retriever.retrieve(query)
-    
-    if not use_hybrid:
-        return vector_results
-    
-    # Perform BM25 search
-    bm25_results = bm25_search(query, top_k=top_k)
-    
-    if not bm25_results:
-        # If BM25 returns no results, fall back to vector search
-        return vector_results
-    
-    # Combine results using RRF
-    combined_results = reciprocal_rank_fusion(
-        vector_results=vector_results,
-        bm25_results=bm25_results,
-        k=60
-    )
-    
-    # Return top_k results
-    return combined_results[:top_k]
+    with traced_operation(
+        "hybrid_search",
+        {
+            "query": query,
+            "top_k": top_k,
+            "use_hybrid": use_hybrid,
+            "search_mode": "hybrid" if use_hybrid else "vector_only"
+        }
+    ) as span:
+        # Note: fulltext index should be created/updated during indexing, not during query
+        # This avoids the expensive update_fulltext_index() call on every query
+        
+        # Get vector store retriever
+        vector_retriever = index.as_retriever(similarity_top_k=top_k)
+        vector_results = vector_retriever.retrieve(query)
+        
+        add_span_attributes(span, {"vector_result_count": len(vector_results)})
+        
+        if not use_hybrid:
+            add_span_attributes(span, {"final_result_count": len(vector_results)})
+            return vector_results
+        
+        # Perform BM25 search
+        bm25_results = bm25_search(query, top_k=top_k)
+        
+        add_span_attributes(span, {"bm25_result_count": len(bm25_results)})
+        
+        if not bm25_results:
+            # If BM25 returns no results, fall back to vector search
+            add_span_attributes(span, {
+                "fallback": "vector_only",
+                "final_result_count": len(vector_results)
+            })
+            return vector_results
+        
+        # Combine results using RRF
+        combined_results = reciprocal_rank_fusion(
+            vector_results=vector_results,
+            bm25_results=bm25_results,
+            k=60
+        )
+        
+        final_results = combined_results[:top_k]
+        add_span_attributes(span, {"final_result_count": len(final_results)})
+        
+        # Return top_k results
+        return final_results
