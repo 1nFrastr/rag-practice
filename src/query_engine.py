@@ -19,12 +19,14 @@ MIN_RERANK_SCORE_THRESHOLD = 0.3  # 30%
 class DebugInfo:
     """Container for debugging information."""
     
+    # Vector search results (before reranking, when not using hybrid)
+    vector_results: List[dict]  # [{filename, score, text_preview, chunk_id}]
     # Hybrid search results (before reranking)
-    hybrid_results: List[dict]  # [{filename, score, text_preview}]
+    hybrid_results: List[dict]  # [{filename, score, text_preview, chunk_id}]
     # Reranked results
-    reranked_results: List[dict]  # [{filename, score, text_preview}]
+    reranked_results: List[dict]  # [{filename, score, text_preview, chunk_id}]
     # Final results sent to LLM (after filtering)
-    final_results: List[dict]  # [{filename, score, text_preview}]
+    final_results: List[dict]  # [{filename, score, text_preview, chunk_id}]
     # The actual prompt/context sent to LLM
     llm_input: str
 
@@ -90,8 +92,11 @@ def query(
         text = node.text
         preview = text[:max_preview_len] + "..." if len(text) > max_preview_len else text
         filename = node.metadata.get("filename", "Unknown")
+        chunk_hash = node.metadata.get("chunk_hash", "")
+        # 只取前8位作为短标识符
+        chunk_id = chunk_hash[:8] if chunk_hash else node.node_id[:8]
         score = node_with_score.score if node_with_score.score is not None else 0.0
-        return {"filename": filename, "score": score, "text_preview": preview}
+        return {"filename": filename, "score": score, "text_preview": preview, "chunk_id": chunk_id}
     
     # Initialize debug info
     debug_hybrid_results = []
@@ -105,16 +110,15 @@ def query(
         from .hybrid_search import hybrid_search
         from .reranker import rerank_results
         
-        # Perform hybrid search (top_k=20 for reranking)
-        top_k = 20 if use_rerank else 3
+        # Always retrieve 20 candidates for better debug visibility
         retrieved_nodes = hybrid_search(
             index=index,
             query=question,
-            top_k=top_k,
+            top_k=20,
             use_hybrid=True
         )
         
-        # Collect hybrid search debug info
+        # Collect hybrid search debug info (all 20 results)
         debug_hybrid_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
         
         # Apply reranking if enabled
@@ -126,6 +130,9 @@ def query(
             )
             # Collect reranked debug info
             debug_reranked_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+        else:
+            # Without reranking, take top 3 from hybrid results
+            retrieved_nodes = retrieved_nodes[:3]
         
         # Use retrieved nodes to create context
         from llama_index.core import get_response_synthesizer
@@ -176,6 +183,7 @@ def query(
         
         # Create debug info object
         debug_info = DebugInfo(
+            vector_results=[],  # No separate vector search in hybrid mode
             hybrid_results=debug_hybrid_results,
             reranked_results=debug_reranked_results,
             final_results=debug_final_results,
@@ -190,42 +198,76 @@ def query(
             debug_info=debug_info,
         )
     else:
-        # Use standard vector search
-        query_engine = create_query_engine(index, similarity_top_k=3)
-        response = query_engine.query(question)
-
-        # Extract source information
+        # Use standard vector search (with optional reranking)
+        from .reranker import rerank_results
+        from llama_index.core import get_response_synthesizer
+        
+        # Always retrieve 20 candidates for better debug visibility
+        vector_retriever = index.as_retriever(similarity_top_k=20)
+        retrieved_nodes = vector_retriever.retrieve(question)
+        
+        # Collect vector search debug info (all 20 results)
+        debug_vector_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+        
+        # Apply reranking if enabled
+        if use_rerank:
+            retrieved_nodes = rerank_results(
+                query=question,
+                nodes=retrieved_nodes,
+                top_n=3
+            )
+            # Collect reranked debug info
+            debug_reranked_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+            
+            # Filter out low-score results
+            filtered_nodes = [
+                node for node in retrieved_nodes
+                if node.score is not None and node.score >= MIN_RERANK_SCORE_THRESHOLD
+            ]
+            # Always keep at least the top result even if below threshold
+            if not filtered_nodes and retrieved_nodes:
+                filtered_nodes = [retrieved_nodes[0]]
+            retrieved_nodes = filtered_nodes
+        else:
+            # Without reranking, take top 3 from vector results
+            retrieved_nodes = retrieved_nodes[:3]
+        
+        # Collect final results debug info
+        debug_final_results = [_node_to_debug_dict(n) for n in retrieved_nodes]
+        
+        # Build LLM input context for debug display
+        context_parts = []
+        for i, node_with_score in enumerate(retrieved_nodes):
+            context_parts.append(f"[Document {i+1}]\n{node_with_score.node.text}")
+        debug_llm_input = f"Question: {question}\n\n---\nContext:\n" + "\n\n---\n".join(context_parts)
+        
+        # Create response from retrieved nodes
+        llm = get_llm()
+        synthesizer = get_response_synthesizer(response_mode=ResponseMode.COMPACT, llm=llm)
+        response = synthesizer.synthesize(
+            query=question,
+            nodes=retrieved_nodes
+        )
+        
+        # Extract source information from retrieved nodes
         source_chunks = []
         source_files = []
         scores = []
-
-        for node in response.source_nodes:
+        
+        for node_with_score in retrieved_nodes:
+            node = node_with_score.node
             source_chunks.append(node.text)
-            scores.append(node.score if node.score is not None else 0.0)
+            scores.append(node_with_score.score if node_with_score.score is not None else 0.0)
             if "filename" in node.metadata:
                 source_files.append(node.metadata["filename"])
             else:
                 source_files.append("Unknown")
         
-        # Build debug info for vector-only search
-        debug_vector_results = []
-        for node in response.source_nodes:
-            text = node.text
-            preview = text[:100] + "..." if len(text) > 100 else text
-            filename = node.metadata.get("filename", "Unknown")
-            score = node.score if node.score is not None else 0.0
-            debug_vector_results.append({"filename": filename, "score": score, "text_preview": preview})
-        
-        # Build LLM input for debug
-        context_parts = []
-        for i, node in enumerate(response.source_nodes):
-            context_parts.append(f"[Document {i+1}]\n{node.text}")
-        debug_llm_input = f"Question: {question}\n\n---\nContext:\n" + "\n\n---\n".join(context_parts)
-        
         debug_info = DebugInfo(
+            vector_results=debug_vector_results,  # Initial vector search results
             hybrid_results=[],  # No hybrid search in this mode
-            reranked_results=[],  # No reranking in this mode
-            final_results=debug_vector_results,
+            reranked_results=debug_reranked_results if use_rerank else [],
+            final_results=debug_final_results,
             llm_input=debug_llm_input
         )
 

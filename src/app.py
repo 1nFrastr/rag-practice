@@ -94,44 +94,56 @@ def handle_query(
         if show_debug and result.debug_info:
             debug_parts = []
             
-            # Hybrid search results
+            # First stage: Hybrid search or Vector search results
             if result.debug_info.hybrid_results:
+                # Hybrid search mode
                 debug_parts.append("## 🔍 混合检索结果 (Hybrid Search)")
                 debug_parts.append(f"共 {len(result.debug_info.hybrid_results)} 个结果（显示前10）：\n")
                 for i, r in enumerate(result.debug_info.hybrid_results[:10]):  # Show top 10
-                    debug_parts.append(f"{i+1}. **{r['filename']}** — RRF score: `{r['score']:.4f}`")
+                    chunk_id = r.get('chunk_id', '')
+                    debug_parts.append(f"{i+1}. **{r['filename']}** `[{chunk_id}]` — RRF score: `{r['score']:.4f}`")
+                debug_parts.append("")
+                debug_parts.append("---")
+                debug_parts.append("")
+            elif result.debug_info.vector_results:
+                # Vector search mode (with or without rerank)
+                debug_parts.append("## 🔍 向量检索结果 (Vector Search)")
+                debug_parts.append(f"共 {len(result.debug_info.vector_results)} 个结果（显示前10）：\n")
+                for i, r in enumerate(result.debug_info.vector_results[:10]):  # Show top 10
+                    chunk_id = r.get('chunk_id', '')
+                    debug_parts.append(f"{i+1}. **{r['filename']}** `[{chunk_id}]` — similarity: `{r['score']:.4f}`")
+                debug_parts.append("")
+                debug_parts.append("---")
                 debug_parts.append("")
             
-            debug_parts.append("---")
-            debug_parts.append("")
-            
-            # Reranked results
+            # Reranked results (only shown when reranking is enabled)
             if result.debug_info.reranked_results:
                 debug_parts.append("## 🎯 重排序结果 (After Rerank)")
                 debug_parts.append("阈值: < 30% 将被过滤\n")
                 for i, r in enumerate(result.debug_info.reranked_results):
                     score_pct = r['score'] * 100
                     status = "✅" if score_pct >= 30 else "❌"
-                    debug_parts.append(f"{i+1}. {status} **{r['filename']}** — `{score_pct:.1f}%`")
+                    chunk_id = r.get('chunk_id', '')
+                    debug_parts.append(f"{i+1}. {status} **{r['filename']}** `[{chunk_id}]` — `{score_pct:.1f}%`")
+                debug_parts.append("")
+                debug_parts.append("---")
                 debug_parts.append("")
             
-            debug_parts.append("---")
-            debug_parts.append("")
-            
-            # Final results sent to LLM
-            debug_parts.append("## ✅ 最终传给 LLM 的结果")
-            if result.debug_info.final_results:
-                debug_parts.append(f"共 {len(result.debug_info.final_results)} 个文档：\n")
-                for i, r in enumerate(result.debug_info.final_results):
-                    score_pct = r['score'] * 100
-                    debug_parts.append(f"{i+1}. **{r['filename']}** — `{score_pct:.1f}%`")
+            # Final results sent to LLM (show when there's multi-stage processing: hybrid or rerank)
+            if result.debug_info.hybrid_results or result.debug_info.reranked_results:
+                debug_parts.append("## ✅ 最终传给 LLM 的结果")
+                if result.debug_info.final_results:
+                    debug_parts.append(f"共 {len(result.debug_info.final_results)} 个文档：\n")
+                    for i, r in enumerate(result.debug_info.final_results):
+                        score_pct = r['score'] * 100
+                        chunk_id = r.get('chunk_id', '')
+                        debug_parts.append(f"{i+1}. **{r['filename']}** `[{chunk_id}]` — `{score_pct:.1f}%`")
+                    debug_parts.append("")
+                else:
+                    debug_parts.append("（无结果通过过滤）")
+                    debug_parts.append("")
+                debug_parts.append("---")
                 debug_parts.append("")
-            else:
-                debug_parts.append("（无结果通过过滤）")
-                debug_parts.append("")
-            
-            debug_parts.append("---")
-            debug_parts.append("")
             
             # LLM Input
             debug_parts.append("## 📝 LLM 输入上下文")
@@ -193,7 +205,7 @@ def create_app() -> gr.Blocks:
                 )
                 debug_checkbox = gr.Checkbox(
                     label="🐛 显示调试信息",
-                    value=False,
+                    value=True,
                     info="显示检索过程的中间结果"
                 )
             
@@ -207,7 +219,7 @@ def create_app() -> gr.Blocks:
             sources_output = gr.Markdown(label="Related Sources")
             
             # Debug information section (collapsible)
-            with gr.Accordion("🔧 调试信息 (Debug Info)", open=False, visible=True) as debug_accordion:
+            with gr.Accordion("🔧 调试信息 (Debug Info)", open=False, visible=True):
                 debug_output = gr.Markdown(
                     label="Debug Information",
                     value="开启「显示调试信息」选项后，这里会显示检索过程的详细信息。"
