@@ -17,6 +17,10 @@ dependencies = [
     "openinference-instrumentation-llama-index>=4.3.9",
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp>=1.39.1",
+    "cohere>=4.0.0",
+    # Multi-format document support (PDF, Word, Excel, PowerPoint, etc.)
+    # Use [all] to include PDF, DOCX, PPTX, XLSX, audio transcription, etc.
+    "markitdown[all]>=0.0.1a3",
 ]
 
 [build-system]

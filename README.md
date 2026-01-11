@@ -1,6 +1,6 @@
 # RAG Notes - Local Q&A Assistant Edited
 
-A local RAG (Retrieval-Augmented Generation) note Q&A assistant that allows you to upload Markdown/TXT files and ask questions about their content.
+A local RAG (Retrieval-Augmented Generation) note Q&A assistant that allows you to upload documents (Markdown, TXT, PDF, Word) and ask questions about their content.
 
 ## Tech Stack
 
@@ -55,7 +55,7 @@ The application will be available at http://localhost:7860
 
 ## Usage
 
-1. **Upload Documents**: Go to the "Upload Documents" tab, select your `.md` or `.txt` files, and click "Index Documents"
+1. **Upload Documents**: Go to the "Upload Documents" tab, select your files (`.md`, `.txt`, `.pdf`, `.docx`), and click "Index Documents"
 
 2. **Ask Questions**: Go to the "Ask Questions" tab, enter your question, and click "Ask"
 

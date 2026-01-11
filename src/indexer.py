@@ -3,9 +3,10 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
 
 import psycopg2
+from markitdown import MarkItDown
 from llama_index.core import Document, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -97,10 +98,79 @@ def get_vector_store() -> PGVectorStore:
     )
 
 
+# Supported file extensions (MarkItDown supports many formats)
+# Note: .doc (old Word 97-2003) is NOT supported, please convert to .docx
+SUPPORTED_EXTENSIONS = {
+    ".txt", ".md",           # Plain text
+    ".pdf",                  # PDF documents
+    ".docx",                 # Word documents (new format only)
+    ".xls", ".xlsx",         # Excel spreadsheets
+    ".ppt", ".pptx",         # PowerPoint presentations
+    ".html", ".htm",         # HTML files
+    ".csv",                  # CSV files
+    ".json", ".xml",         # Data formats
+    ".jpg", ".jpeg", ".png", ".gif", ".webp",  # Images (extracts text/metadata)
+}
+
+# Global MarkItDown instance (reusable)
+_markitdown = None
+
+
+def get_markitdown() -> MarkItDown:
+    """Get or create MarkItDown instance."""
+    global _markitdown
+    if _markitdown is None:
+        _markitdown = MarkItDown()
+    return _markitdown
+
+
+def extract_text_from_file(file_path: Path) -> Optional[str]:
+    """
+    Extract text content from file using Microsoft MarkItDown.
+    
+    Supported formats:
+    - .txt, .md: Plain text files
+    - .pdf: PDF documents  
+    - .docx: Word documents (new format, .doc not supported)
+    - .xls, .xlsx: Excel spreadsheets
+    - .ppt, .pptx: PowerPoint presentations
+    - .html: HTML files
+    - .csv, .json, .xml: Data formats
+    - Images: jpg, png, gif, webp (extracts metadata/text)
+    
+    Returns:
+        Extracted text content (as Markdown), or None if format is not supported
+    """
+    suffix = file_path.suffix.lower()
+    
+    # For plain text files, read directly
+    if suffix in {".txt", ".md"}:
+        return file_path.read_text(encoding="utf-8")
+    
+    # Check if format is supported
+    if suffix not in SUPPORTED_EXTENSIONS:
+        return None
+    
+    # Use MarkItDown for other formats
+    try:
+        md = get_markitdown()
+        result = md.convert(str(file_path))
+        return result.text_content
+    except Exception as e:
+        raise ValueError(f"无法解析文件 {file_path.name}: {e}")
+
+
+def is_supported_file(file_path: Path) -> bool:
+    """Check if file extension is supported."""
+    return file_path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
 def load_document(file_path: str) -> Document:
     """Load a single document from file path."""
     path = Path(file_path)
-    content = path.read_text(encoding="utf-8")
+    content = extract_text_from_file(path)
+    if content is None:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
     return Document(
         text=content,
         metadata={"filename": path.name, "filepath": str(path)},
@@ -142,7 +212,16 @@ def index_documents(file_paths: List[str]) -> IndexResult:
         filename = path.name
         files_processed.append(filename)
 
-        content = path.read_text(encoding="utf-8")
+        # Extract text based on file type
+        content = extract_text_from_file(path)
+        if content is None:
+            print(f"Skipping unsupported file: {filename}")
+            continue
+        
+        if not content.strip():
+            print(f"Skipping empty file: {filename}")
+            continue
+
         doc = Document(
             text=content,
             metadata={"filename": filename, "filepath": str(path)},
@@ -190,6 +269,14 @@ def index_documents(file_paths: List[str]) -> IndexResult:
         embed_model=embed_model,
         show_progress=True,
     )
+
+    # Ensure fulltext index exists for hybrid search
+    try:
+        from .hybrid_search import ensure_fulltext_index, update_fulltext_index
+        ensure_fulltext_index()
+        update_fulltext_index()
+    except Exception as e:
+        print(f"Warning: Could not setup fulltext index: {e}")
 
     return IndexResult(
         total_chunks=total_chunks,
